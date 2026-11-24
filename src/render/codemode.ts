@@ -406,7 +406,12 @@ function skipWsAndComments(src: string, pos: number): number {
 	return i;
 }
 
-function readJsQuoted(src: string, start: number, rawTemplate = false): { value: string; end: number } | undefined {
+function readJsQuoted(
+	src: string,
+	start: number,
+	rawTemplate = false,
+	bindings?: ReadonlyMap<string, string>,
+): { value: string; end: number } | undefined {
 	const quote = src[start];
 	if (quote !== "'" && quote !== '"' && quote !== "`") return undefined;
 	let i = start + 1;
@@ -424,13 +429,14 @@ function readJsQuoted(src: string, start: number, rawTemplate = false): { value:
 			continue;
 		}
 		if (quote === "`" && c === "$" && src[i + 1] === "{") {
-			// Skip balanced template expression `${...}` and insert placeholder.
+			// Skip balanced template expression `${...}` and substitute known string bindings when possible.
+			const exprStart = i + 2;
 			let depth = 1;
 			i += 2;
 			while (i < src.length && depth > 0) {
 				const ch = src[i]!;
 				if (ch === "'" || ch === '"' || ch === "`") {
-					const inner = readJsQuoted(src, i, false);
+					const inner = readJsQuoted(src, i, false, bindings);
 					i = inner ? inner.end : i + 1;
 					continue;
 				}
@@ -438,7 +444,9 @@ function readJsQuoted(src: string, start: number, rawTemplate = false): { value:
 				else if (ch === "}") depth--;
 				i++;
 			}
-			raw += "${…}";
+			const expr = src.slice(exprStart, Math.max(exprStart, i - 1)).trim();
+			const bound = bindings?.get(expr);
+			raw += bound !== undefined ? (rawTemplate ? bound : bound.replace(/\\/g, "\\\\")) : "${…}";
 			continue;
 		}
 		if (c === quote) {
@@ -478,7 +486,11 @@ function skipBalancedValue(src: string, start: number): number {
 	return i;
 }
 
-function parseObjectLiteralArgs(src: string, openBrace: number): { args: Record<string, unknown>; end: number } {
+function parseObjectLiteralArgs(
+	src: string,
+	openBrace: number,
+	bindings?: ReadonlyMap<string, string>,
+): { args: Record<string, unknown>; end: number } {
 	const args: Record<string, unknown> = {};
 	let i = openBrace + 1;
 	while (i < src.length) {
@@ -514,8 +526,10 @@ function parseObjectLiteralArgs(src: string, openBrace: number): { args: Record<
 		}
 
 		i = skipWsAndComments(src, i);
-		// Shorthand `{ path }` — value is a runtime variable, skip until comma/brace.
+		// Shorthand `{ path }` — value is a runtime variable, resolve from simple binding if known.
 		if (src[i] !== ":") {
+			const bound = bindings?.get(key);
+			if (bound !== undefined) args[key] = bound;
 			const next = skipBalancedValue(src, i);
 			if (next <= i) break;
 			i = next;
@@ -524,7 +538,7 @@ function parseObjectLiteralArgs(src: string, openBrace: number): { args: Record<
 		i = skipWsAndComments(src, i + 1);
 
 		if (src.startsWith("String.raw`", i)) {
-			const q = readJsQuoted(src, i + "String.raw".length, true);
+			const q = readJsQuoted(src, i + "String.raw".length, true, bindings);
 			if (q) {
 				args[key] = q.value;
 				i = skipBalancedValue(src, q.end);
@@ -532,7 +546,7 @@ function parseObjectLiteralArgs(src: string, openBrace: number): { args: Record<
 			}
 		}
 		if (src[i] === "'" || src[i] === '"' || src[i] === "`") {
-			const q = readJsQuoted(src, i, false);
+			const q = readJsQuoted(src, i, false, bindings);
 			if (q) {
 				const after = skipWsAndComments(src, q.end);
 				if (after >= src.length || src[after] === "," || src[after] === "}") {
@@ -558,7 +572,7 @@ function parseObjectLiteralArgs(src: string, openBrace: number): { args: Record<
 					continue;
 				}
 				if (src[j] === "'" || src[j] === '"' || src[j] === "`") {
-					const q = readJsQuoted(src, j, false);
+					const q = readJsQuoted(src, j, false, bindings);
 					if (q) {
 						items.push(q.value);
 						j = q.end;
@@ -584,6 +598,15 @@ function parseObjectLiteralArgs(src: string, openBrace: number): { args: Record<
 				continue;
 			}
 		}
+		const varMatch = /^([A-Za-z_$][A-Za-z0-9_$]*)/.exec(src.slice(i));
+		if (varMatch && bindings?.has(varMatch[1]!)) {
+			const after = skipWsAndComments(src, i + varMatch[1]!.length);
+			if (after >= src.length || src[after] === "," || src[after] === "}") {
+				args[key] = bindings.get(varMatch[1]!)!;
+				i = after;
+				continue;
+			}
+		}
 		const next = skipBalancedValue(src, i);
 		if (next <= i) break;
 		i = next;
@@ -595,23 +618,58 @@ function parseObjectLiteralArgs(src: string, openBrace: number): { args: Record<
  * Extract `tools.<name>({ ... })` calls and their literal arguments directly from
  * `args.code` so nested `toolSummary`, `command`, and `path` values stay intact
  * even when Pi's `execute.js` truncates `details.calls[].args` at 200 chars.
+ * Resolves simple `const`/`let`/`var` string bindings used in template literals.
  */
 export function extractCallsFromCode(code: string): ExtractedCodeCall[] {
 	const calls: ExtractedCodeCall[] = [];
+	const bindings = new Map<string, string>();
 	let i = 0;
 	while (i < code.length) {
 		i = skipWsAndComments(code, i);
 		if (i >= code.length) break;
 		if (code.startsWith("String.raw`", i)) {
-			const q = readJsQuoted(code, i + "String.raw".length, true);
+			const q = readJsQuoted(code, i + "String.raw".length, true, bindings);
 			i = q ? q.end : i + 11;
 			continue;
 		}
 		const c = code[i]!;
 		if (c === "'" || c === '"' || c === "`") {
-			const q = readJsQuoted(code, i, false);
+			const q = readJsQuoted(code, i, false, bindings);
 			i = q ? q.end : i + 1;
 			continue;
+		}
+		if (
+			(i === 0 || !/[A-Za-z0-9_$]/.test(code[i - 1]!)) &&
+			/^(?:const|let|var)\s+/.test(code.slice(i))
+		) {
+			const declMatch = /^(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*/.exec(code.slice(i));
+			if (declMatch) {
+				const varName = declMatch[1]!;
+				const valPos = i + declMatch[0].length;
+				let q: { value: string; end: number } | undefined;
+				if (code.startsWith("String.raw`", valPos)) {
+					q = readJsQuoted(code, valPos + "String.raw".length, true, bindings);
+				} else if (code[valPos] === "'" || code[valPos] === '"' || code[valPos] === "`") {
+					q = readJsQuoted(code, valPos, false, bindings);
+				}
+				if (q) {
+					const after = skipWsAndComments(code, q.end);
+					if (
+						after >= code.length ||
+						code[after] === ";" ||
+						code[after] === "\n" ||
+						code[after] === "," ||
+						code[after] === "}" ||
+						code.slice(q.end, after).includes("\n")
+					) {
+						if (!q.value.includes("${…}")) {
+							bindings.set(varName, q.value);
+						}
+						i = q.end;
+						continue;
+					}
+				}
+			}
 		}
 		if (
 			code.startsWith("tools.", i) &&
@@ -625,7 +683,7 @@ export function extractCallsFromCode(code: string): ExtractedCodeCall[] {
 				if (code[openParen] === "(") {
 					const argStart = skipWsAndComments(code, openParen + 1);
 					if (code[argStart] === "{") {
-						const parsed = parseObjectLiteralArgs(code, argStart);
+						const parsed = parseObjectLiteralArgs(code, argStart, bindings);
 						calls.push({ tool, args: parsed.args });
 					} else {
 						calls.push({ tool, args: {} });
@@ -687,7 +745,7 @@ export function parseCallArgsLenient(rawArgs: string): {
 			// Truncated mid-string at the end of the 200-char preview
 			const partial = unescapeJsString(body.slice(i + 1).replace(/\\$/, ""));
 			parsed[key] = partial;
-			if (wasClipped) truncatedKeys.add(key);
+			truncatedKeys.add(key);
 			break;
 		}
 		const primMatch = /^(?:true|false|null|-?\d+(?:\.\d+)?)/.exec(body.slice(i));
@@ -709,6 +767,48 @@ export function parseCallArgsLenient(rawArgs: string): {
 		i = next;
 	}
 	return { parsed, truncatedKeys };
+}
+
+function matchesCodeTemplate(codeVal: string, runtimeVal: string, isTruncated: boolean): boolean {
+	if (!codeVal.includes("${…}")) {
+		return isTruncated ? codeVal.startsWith(runtimeVal) : codeVal === runtimeVal;
+	}
+	const parts = codeVal.split("${…}");
+	if (parts[0] && !runtimeVal.startsWith(parts[0])) return false;
+	let pos = parts[0]?.length ?? 0;
+	for (let idx = 1; idx < parts.length; idx++) {
+		const part = parts[idx]!;
+		if (!part) continue;
+		const found = runtimeVal.indexOf(part, pos);
+		if (found === -1) {
+			// On a truncated runtime string, allow the final unmatched segment to be a prefix match at the tail.
+			if (isTruncated && pos < runtimeVal.length && part.startsWith(runtimeVal.slice(pos))) {
+				return true;
+			}
+			return false;
+		}
+		pos = found + part.length;
+	}
+	if (!isTruncated) {
+		const lastPart = parts[parts.length - 1]!;
+		if (lastPart && !runtimeVal.endsWith(lastPart)) return false;
+	}
+	return true;
+}
+
+function finalizeTruncatedFallback(
+	args: Record<string, unknown>,
+	truncatedKeys: ReadonlySet<string>,
+): Record<string, unknown> {
+	if (truncatedKeys.size === 0) return args;
+	const out: Record<string, unknown> = { ...args };
+	for (const key of truncatedKeys) {
+		const val = out[key];
+		if (typeof val === "string" && val.length > 0 && !val.endsWith("…")) {
+			out[key] = `${val}…`;
+		}
+	}
+	return out;
 }
 
 function resolveMergedCallArgs(
@@ -735,7 +835,7 @@ function resolveMergedCallArgs(
 			if (SUMMARY_META_KEYS.has(k) || !(k in codeArgs)) continue;
 			const cv = codeArgs[k];
 			if (typeof rv === "string" && typeof cv === "string") {
-				if (truncatedKeys.has(k) ? !cv.startsWith(rv) : cv !== rv) {
+				if (!matchesCodeTemplate(cv, rv, truncatedKeys.has(k))) {
 					compatible = false;
 					break;
 				}
@@ -752,22 +852,25 @@ function resolveMergedCallArgs(
 	if (bestIdx === undefined && candidates.length === 1) {
 		bestIdx = candidates[0];
 	}
-	if (bestIdx === undefined) return runtimeArgs;
+	if (bestIdx === undefined) return finalizeTruncatedFallback(runtimeArgs, truncatedKeys);
 
 	usedIndices.add(bestIdx);
 	const merged: Record<string, unknown> = { ...extracted[bestIdx]!.args };
+	const unresolvedTruncated = new Set<string>();
 	for (const [k, rv] of Object.entries(runtimeArgs)) {
 		if (
 			truncatedKeys.has(k) &&
 			typeof rv === "string" &&
 			typeof merged[k] === "string" &&
+			!(merged[k] as string).includes("${…}") &&
 			(merged[k] as string).startsWith(rv)
 		) {
 			continue;
 		}
 		merged[k] = rv;
+		if (truncatedKeys.has(k)) unresolvedTruncated.add(k);
 	}
-	return merged;
+	return finalizeTruncatedFallback(merged, unresolvedTruncated);
 }
 
 function formatStatusIcon(status: CodemodeCallRecord["status"], theme: ThemeLike): string {
@@ -1272,7 +1375,17 @@ export function createCodemodeToolRendererResolver(
 							const nextChildren: unknown[] = [];
 							if (calls.length > 0) {
 								const expanded = Boolean(options?.expanded);
-								const extractedCalls = renderState?.extractedCalls;
+								let extractedCalls = renderState?.extractedCalls;
+								if (!extractedCalls) {
+									const rawCode = (context as { args?: { code?: unknown } } | undefined)?.args?.code;
+									if (typeof rawCode === "string") {
+										extractedCalls = extractCallsFromCode(rawCode);
+										if (renderState) {
+											renderState.code = rawCode;
+											renderState.extractedCalls = extractedCalls;
+										}
+									}
+								}
 								const hl = getHighlighter();
 								const themeLike = theme as ThemeLike;
 								nextChildren.push(new Spacer(1));

@@ -509,3 +509,105 @@ test("shortenShellCommandPaths shortens cwd and $HOME paths in codemode bash/ls 
 	assert.match(bashLine!, /lani-server\/npc\/custom\/achievement_tracking\.txt.*  9ms$/);
 	assert.equal(lsLine, "✓ ls lani-server/sql-files  2ms");
 });
+
+test("extractCallsFromCode resolves const string bindings in template literals and recovers 200-char truncated args (screenshot regression)", () => {
+	const home = homedir();
+	const cwd = `${home}/Documents/Repo/ragnarok`;
+	const web = `${cwd}/lani-web`;
+	const code = [
+		`const web = '${web}';`,
+		"const results = await Promise.allSettled([",
+		"  tools.bash({",
+		"    command: `find '${web}/src/routes/(player-dashboard)' -maxdepth 3 | sort`,",
+		"    toolSummary: 'List player dashboard routes and components',",
+		"  }),",
+		"  tools.bash({",
+		"    command: `find '${web}/src/routes/(dashboard)/admin/accounts/[accountId]/char/[charId]' -maxdepth 2 | sort`,",
+		"    toolSummary: 'Inspect admin character detail tabs/components',",
+		"  }),",
+		"  tools.bash({",
+		"    command: `find '${web}/src/routes/(dashboard)/admin/rate-schedule' '${web}/src/routes/(dashboard)/admin/reward-campaigns' '${web}/src/routes/(dashboard)/admin/economy' -maxdepth 2 | sort`,",
+		"    toolSummary: 'Inspect rate-schedule, reward-campaigns, and economy routes',",
+		"  }),",
+		"  tools.read({",
+		"    path: `${web}/src/routes/(player-dashboard)/dashboard/+layout.svelte`,",
+		"    offset: 1,",
+		"    limit: 100,",
+		"    toolSummary: 'Check player dashboard nav items',",
+		"  }),",
+		"]);",
+	].join("\n");
+
+	const calls = [
+		{
+			name: "bash",
+			args: `{"command":"find '${web}/src/routes/(player-dashboard)' -maxdepth 3 | sort","toolSummary":"List player dashboard routes and components"}`,
+			status: "ok" as const,
+			durationMs: 14,
+		},
+		{
+			name: "bash",
+			args: `{"command":"find '${web}/src/routes/(dashboard)/admin/accounts/[accountId]/char/[charId]' -maxdepth 2 | sort","toolSummary":"Inspect admin character det...`,
+			status: "ok" as const,
+			durationMs: 10,
+		},
+		{
+			name: "bash",
+			args: `{"command":"find '${web}/src/routes/(dashboard)/admin/rate-schedule' '${web}/src/routes/(dashboard)/admin/r...`,
+			status: "ok" as const,
+			durationMs: 9,
+		},
+		{
+			name: "read",
+			args: `{"path":"${web}/src/routes/(player-dashboard)/dashboard/+layout.svelte","offset":1,"limit":100,"toolSummary":"Check player dashboard nav items"}`,
+			status: "ok" as const,
+			durationMs: 6,
+		},
+	];
+
+	const ansiTheme: ThemeLike = {
+		name: "ansi",
+		fg: (_c, t) => t,
+		bold: (t) => t,
+		italic: (t) => t,
+		underline: (t) => t,
+		strikethrough: (t) => t,
+		getFgAnsi: () => "",
+		getBgAnsi: () => "",
+	};
+	const resolver = createCodemodeToolRendererResolver(() => () => undefined);
+	const renderer = resolver("codemode", () => ({
+		renderResult() {
+			const c = new Container();
+			c.addChild(new Text("placeholder", 0, 0));
+			return c;
+		},
+	}))!;
+
+	// Even with empty state (no prior renderCall, e.g. after /reload), renderResult extracts from context.args.code!
+	const comp = renderer.renderResult!(
+		{ content: [{ type: "text", text: "ok" }], details: { calls } },
+		{ expanded: true, isPartial: false },
+		ansiTheme,
+		{ isError: false, state: {}, cwd, args: { code } },
+	) as Container;
+
+	const rendered = comp.render(220).map((l) => l.trimEnd()).join("\n");
+	assert.match(rendered, /Inspect admin character detail tabs\/components/);
+	assert.match(rendered, /Inspect rate-schedule, reward-campaigns, and economy routes/);
+	assert.match(rendered, /lani-web\/src\/routes\/\(dashboard\)\/admin\/reward-campaigns/);
+	assert.match(rendered, /lani-web\/src\/routes\/\(dashboard\)\/admin\/economy/);
+	assert.ok(!rendered.includes("admin/r  9ms"), "must not leave truncated admin/r stub without recovery");
+
+	// Dynamic unresolved `${...}` expression still recovers toolSummary and marks unrecovered truncated command with `…`
+	const dynamicCode = `for (const d of dirs) await tools.bash({ command: \`find '\${d}' -type f\`, toolSummary: 'List dynamic dir' });`;
+	const dynamicOut = formatCodemodeCalls(
+		[{ name: "bash", args: `{"command":"find '/some/very/long/dynamic/path/trunc...`, status: "ok", durationMs: 5 }],
+		true,
+		ansiTheme,
+		undefined,
+		{ extractedCalls: extractCallsFromCode(dynamicCode), cwd },
+	);
+	assert.match(dynamicOut, /List dynamic dir/);
+	assert.match(dynamicOut, /\/some\/very\/long\/dynamic\/path\/trunc…/);
+});
