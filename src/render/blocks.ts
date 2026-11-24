@@ -2,6 +2,7 @@ import { renderCode } from "./code.ts";
 import { offsetCodeActions, type RenderContext } from "./context.ts";
 import { latexFallback, renderInline } from "./inline.ts";
 import { lexInline } from "./lexer.ts";
+import { isBareStreamingBlockPrefix, stabilizeStreamingInline } from "./stream-stabilize.ts";
 import { renderTable } from "./table.ts";
 import { visibleWidth, wrap } from "./util.ts";
 
@@ -18,9 +19,18 @@ const CALLOUTS: Record<string, { icon: string; color: string; label: string }> =
 /** Render a sequence of block tokens, separated by one blank line (or none when `tight`). */
 export function renderBlocks(tokens: any[], ctx: RenderContext, tight = false): string[] {
 	const out: string[] = [];
-	for (const token of tokens) {
+	let lastRenderable = -1;
+	for (let i = tokens.length - 1; i >= 0; i--) {
+		if (tokens[i]?.type !== "space" && tokens[i]?.type !== "def") {
+			lastRenderable = i;
+			break;
+		}
+	}
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
 		if (token.type === "space" || token.type === "def") continue;
-		const lines = renderBlock(token, offsetCodeActions(ctx, 0, out.length + (out.length > 0 && !tight ? 1 : 0)));
+		const blockCtx = offsetCodeActions(ctx, 0, out.length + (out.length > 0 && !tight ? 1 : 0));
+		const lines = renderBlock(token, { ...blockCtx, streaming: ctx.streaming && i === lastRenderable });
 		if (lines.length === 0) continue;
 		if (out.length > 0 && !tight) out.push("");
 		out.push(...lines);
@@ -28,14 +38,32 @@ export function renderBlocks(tokens: any[], ctx: RenderContext, tight = false): 
 	return out;
 }
 
+function renderStreamingInlineTokens(token: any, ctx: RenderContext): string {
+	if (ctx.streaming) {
+		const raw = typeof token.text === "string" ? token.text : typeof token.raw === "string" ? token.raw : "";
+		if (raw) {
+			const stabilized = stabilizeStreamingInline(raw);
+			if (stabilized !== raw) {
+				return renderInline(lexInline(stabilized), ctx);
+			}
+		}
+	}
+	return token.tokens ? renderInline(token.tokens, ctx) : String(token.text ?? "");
+}
+
 export function renderBlock(token: any, ctx: RenderContext): string[] {
 	switch (token.type) {
 		case "heading":
 			return renderHeading(token, ctx);
-		case "paragraph":
-			return wrap(renderInline(token.tokens, ctx), ctx.width);
+		case "paragraph": {
+			if (ctx.streaming) {
+				const raw = String(token.text ?? token.raw ?? "");
+				if (isBareStreamingBlockPrefix(raw)) return [];
+			}
+			return wrap(renderStreamingInlineTokens(token, ctx), ctx.width);
+		}
 		case "text":
-			return wrap(token.tokens ? renderInline(token.tokens, ctx) : token.text, ctx.width);
+			return wrap(renderStreamingInlineTokens(token, ctx), ctx.width);
 		case "code":
 			return renderCode(token, ctx);
 		case "table":
@@ -66,7 +94,9 @@ function renderHeading(token: any, ctx: RenderContext): string[] {
 				: token.depth === 5
 					? (t: string) => style.bold(t)
 					: (t: string) => style.italic(style.fg("muted", t));
-	const content = renderInline(token.tokens, { ...ctx, textStyle });
+	const content = renderStreamingInlineTokens(token, { ...ctx, textStyle });
+	// While streaming, wait until heading text arrives before drawing underlines so `# ` -> `### ` does not jump height.
+	if (ctx.streaming && !content.trim()) return [];
 	switch (token.depth) {
 		case 1: {
 			const lines = wrap(textStyle(content), width);
@@ -108,7 +138,13 @@ function renderList(token: any, ctx: RenderContext): string[] {
 			markerWidth = token.ordered ? markerWidth + 2 : 1;
 		}
 		const indent = markerWidth + 1;
-		const childCtx: RenderContext = { ...offsetCodeActions(ctx, indent, out.length + (index > 0 && token.loose ? 1 : 0)), width: Math.max(1, ctx.width - indent), listDepth: ctx.listDepth + 1 };
+		const isLastItem = index === token.items.length - 1;
+		const childCtx: RenderContext = {
+			...offsetCodeActions(ctx, indent, out.length + (index > 0 && token.loose ? 1 : 0)),
+			width: Math.max(1, ctx.width - indent),
+			listDepth: ctx.listDepth + 1,
+			streaming: ctx.streaming && isLastItem,
+		};
 		const tokens = (item.tokens ?? []).filter((t: any) => t.type !== "checkbox");
 		const body = renderBlocks(tokens, childCtx, !item.loose);
 		const lines = body.length > 0 ? body : [""];

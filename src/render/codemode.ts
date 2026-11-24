@@ -177,6 +177,55 @@ export function middleTruncatePath(displayPath: string, maxWidth: number): strin
 	return `${start}…${end}`;
 }
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const SHELL_PATH_PREFIX_BOUNDARY = `(^|[\\s'"=:(,;\`{])`;
+const SHELL_PATH_SUFFIX_BOUNDARY = `(?=$|[\\s'"\\),;&|><\`}:])`;
+
+/**
+ * Shorten absolute `cwd` and `$HOME` paths embedded inside a shell command or
+ * generic argument string for display only (never mutates executed args).
+ * Prefers `cwd`-relative paths for targets under `cwd`, and falls back to `~`
+ * for other paths under `$HOME`.
+ */
+export function shortenShellCommandPaths(text: string, cwd?: string): string {
+	let out = text;
+	const home = homedir().replace(/[/\\]+$/, "");
+	const absCwd = cwd ? resolvePath(expandHome(cwd)).replace(/[/\\]+$/, "") : "";
+
+	if (absCwd && absCwd !== "/" && !/^[A-Za-z]:$/.test(absCwd)) {
+		const cwdForms = [absCwd];
+		const tildeCwd = shortenHome(absCwd);
+		if (tildeCwd !== absCwd && tildeCwd !== "~") cwdForms.push(tildeCwd);
+		const exactReplacement = absCwd === home ? "~" : ".";
+		for (const form of cwdForms) {
+			const escaped = escapeRegExp(form);
+			// `<cwd>/<subpath>` -> `<subpath>`
+			out = out.replace(
+				new RegExp(`${SHELL_PATH_PREFIX_BOUNDARY}${escaped}[/\\\\](?=[^\\s'"\\),;&|><\`}:])`, "g"),
+				"$1",
+			);
+			// `<cwd>` or `<cwd>/` at token end -> `.` (or `~` if cwd === home)
+			out = out.replace(
+				new RegExp(`${SHELL_PATH_PREFIX_BOUNDARY}${escaped}[/\\\\]?${SHELL_PATH_SUFFIX_BOUNDARY}`, "g"),
+				`$1${exactReplacement}`,
+			);
+		}
+	}
+
+	if (home && home !== "/" && !/^[A-Za-z]:$/.test(home)) {
+		const escapedHome = escapeRegExp(home);
+		out = out.replace(
+			new RegExp(`${SHELL_PATH_PREFIX_BOUNDARY}${escapedHome}(?=[/\\\\]|$|[\\s'"\\),;&|><\`}:])`, "g"),
+			"$1~",
+		);
+	}
+
+	return out;
+}
+
 /**
  * Shorten a file path for display: prefer a `cwd`-relative path when the target
  * lives inside `cwd`, otherwise shorten `$HOME` to `~`. Optionally middle-truncate
@@ -771,6 +820,7 @@ function formatGenericCallBody(
 	rawFallback: string,
 	expanded: boolean,
 	theme: ThemeLike,
+	cwd?: string,
 ): string {
 	const title = theme.bold(fg(theme, "toolTitle", "text", label));
 	const entries = Object.entries(args).filter(
@@ -778,7 +828,7 @@ function formatGenericCallBody(
 	);
 	if (entries.length === 0) {
 		if (rawFallback && !rawFallback.trim().startsWith("{")) {
-			return `${title} ${fg(theme, "accent", "muted", rawFallback.trim())}`;
+			return `${title} ${fg(theme, "accent", "muted", shortenShellCommandPaths(rawFallback.trim(), cwd))}`;
 		}
 		return title;
 	}
@@ -786,11 +836,11 @@ function formatGenericCallBody(
 	const parts = entries.slice(0, maxEntries).map(([k, v]) => {
 		let valStr: string;
 		if (typeof v === "string") {
-			const clean = v.replace(/\s+/g, " ").trim();
+			const clean = shortenShellCommandPaths(v.replace(/\s+/g, " ").trim(), cwd);
 			valStr =
 				!expanded && clean.length > 48 ? `"${clean.slice(0, 45)}…"` : `"${clean}"`;
 		} else if (Array.isArray(v)) {
-			const joined = v.map(String).join(", ");
+			const joined = shortenShellCommandPaths(v.map(String).join(", "), cwd);
 			valStr = `[${!expanded && joined.length > 40 ? `${joined.slice(0, 37)}…` : joined}]`;
 		} else {
 			const s = JSON.stringify(v) ?? String(v);
@@ -819,20 +869,23 @@ export function formatSingleNestedCallBody(
 	if (cleanName === "bash" || cleanName === "powershell") {
 		const rawCmd = pickStr(args, ["command", "cmd"]);
 		if (rawCmd) {
-			const lines = rawCmd.replace(/\r\n?/g, "\n").split("\n");
+			const prompt = cleanName === "powershell" ? "PS>" : "$";
+			const lang = cleanName === "powershell" ? "powershell" : "bash";
+			const shortenedCmd = shortenShellCommandPaths(rawCmd, cwd);
+			const lines = shortenedCmd.replace(/\r\n?/g, "\n").split("\n");
 			let displayCmd = lines.join("\n");
 			let hiddenLines = 0;
 			if (!expanded) {
+				const maxLineChars =
+					lineBudget !== undefined
+						? Math.min(COLLAPSED_BASH_LINE_CHARS, Math.max(20, lineBudget - prompt.length - 1))
+						: COLLAPSED_BASH_LINE_CHARS;
 				const clipped = lines.slice(0, COLLAPSED_BASH_MAX_LINES).map((line) =>
-					line.length > COLLAPSED_BASH_LINE_CHARS
-						? `${line.slice(0, COLLAPSED_BASH_LINE_CHARS - 1)}…`
-						: line,
+					line.length > maxLineChars ? `${line.slice(0, maxLineChars - 1)}…` : line,
 				);
 				hiddenLines = Math.max(0, lines.length - COLLAPSED_BASH_MAX_LINES);
 				displayCmd = clipped.join("\n");
 			}
-			const prompt = cleanName === "powershell" ? "PS>" : "$";
-			const lang = cleanName === "powershell" ? "powershell" : "bash";
 			const formatted =
 				formatShellCommandCall(
 					{ command: displayCmd, timeout: pickNum(args, ["timeout"]) },
@@ -848,6 +901,15 @@ export function formatSingleNestedCallBody(
 			return hiddenLines > 0
 				? `${indented}\n  ${fg(theme, "muted", "dim", `… (+${hiddenLines} lines)`)}`
 				: indented;
+		}
+	}
+
+	if (cleanName === "ls") {
+		const p = pickStr(args, ["path", "directory"]);
+		if (p) {
+			const pathBudget =
+				lineBudget !== undefined ? Math.max(12, lineBudget - visibleWidth("ls ")) : undefined;
+			return `${theme.bold(fg(theme, "toolTitle", "text", "ls"))} ${formatStyledPath(p, theme, cwd, pathBudget)}`;
 		}
 	}
 
@@ -928,7 +990,7 @@ export function formatSingleNestedCallBody(
 		}
 	}
 
-	return formatGenericCallBody(displayName, args, rawArgsFallback, expanded, theme);
+	return formatGenericCallBody(displayName, args, rawArgsFallback, expanded, theme, cwd);
 }
 
 /**

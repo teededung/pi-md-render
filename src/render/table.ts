@@ -57,6 +57,14 @@ function longestWord(text: string): number {
 	return longest;
 }
 
+function hasCompleteClosingPipe(raw: string, columnCount: number): boolean {
+	const lastLine = raw.slice(raw.lastIndexOf("\n") + 1).trim();
+	if (!lastLine.endsWith("|")) return false;
+	const unescapedPipes = lastLine.replace(/\\\|/g, "").match(/\|/g)?.length ?? 0;
+	const requiredPipes = lastLine.startsWith("|") ? columnCount + 1 : columnCount;
+	return unescapedPipes >= requiredPipes;
+}
+
 /**
  * Table with rounded borders, bold header, column alignment and CJK-aware
  * widths. Too narrow for a grid → one "card" per row.
@@ -65,9 +73,17 @@ export function renderTable(token: any, ctx: RenderContext): string[] {
 	const { style } = ctx;
 	const cellCtx: RenderContext = { ...ctx, width: Math.max(1, ctx.width) };
 	const header: string[] = token.header.map((cell: any) => renderInline(cell.tokens, cellCtx));
-	const rows: string[][] = token.rows.map((row: any[]) => row.map((cell: any) => renderInline(cell.tokens, cellCtx)));
-	const aligns: Align[] = token.align.map((a: string | null) => (a === "center" || a === "right" ? a : "left"));
 	const n = header.length;
+	// While streaming, hold back an incomplete trailing row until `\n` or all column
+	// cells + closing `|` have arrived, so multi-column rows never blink in/out between
+	// columns and widths above do not jitter on every incoming character.
+	const raw = typeof token.raw === "string" ? token.raw : "";
+	const rawRows: any[][] = Array.isArray(token.rows) ? token.rows : [];
+	const hasIncompleteTailRow =
+		ctx.streaming && rawRows.length > 0 && !/\n$/.test(raw) && !hasCompleteClosingPipe(raw, n);
+	const stableRawRows = hasIncompleteTailRow ? rawRows.slice(0, -1) : rawRows;
+	const rows: string[][] = stableRawRows.map((row: any[]) => row.map((cell: any) => renderInline(cell.tokens, cellCtx)));
+	const aligns: Align[] = token.align.map((a: string | null) => (a === "center" || a === "right" ? a : "left"));
 
 	const natural = new Array(n).fill(0);
 	const minimum = new Array(n).fill(0);

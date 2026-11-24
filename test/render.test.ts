@@ -5,6 +5,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { noMath } from "../src/render/context.ts";
 import { lex } from "../src/render/lexer.ts";
 import { cacheStats, clearBlockCache, renderMarkdown } from "../src/render/rich-markdown.ts";
+import { stabilizeStreamingInline } from "../src/render/stream-stabilize.ts";
 import { fitColumns } from "../src/render/table.ts";
 import { wrap } from "../src/render/util.ts";
 import { placeholderRows } from "../src/math/kitty.ts";
@@ -282,5 +283,64 @@ test("light theme mathColor fallback and table header background across resets",
 	});
 	assert.ok(lines[1]!.includes("\x1b[0m\x1b[48;2;232;238;252m"), "re-applies headerBg after SGR 0 reset");
 });
+
+test("streaming stabilizer eliminates raw marker flashes, URL jumps, heading bounce, and mid-row table jitter", () => {
+	// 1. Char-by-char **bold** never flashes raw `*` or `**`
+	const boldPhrase = "Hello **important** world";
+	for (let i = 1; i <= boldPhrase.length; i++) {
+		const out = render(boldPhrase.slice(0, i), 80, true).join("\n");
+		assert.ok(!out.includes("*"), `raw '*' leaked at prefix ${i} (${JSON.stringify(boldPhrase.slice(0, i))}): ${JSON.stringify(out)}`);
+	}
+
+	// 2. Char-by-char `codespan` never flashes raw backticks
+	const codePhrase = "Run `npm test` now";
+	for (let i = 1; i <= codePhrase.length; i++) {
+		const out = render(codePhrase.slice(0, i), 80, true).join("\n");
+		assert.ok(!out.includes("`"), `raw '\`' leaked at prefix ${i} (${JSON.stringify(codePhrase.slice(0, i))}): ${JSON.stringify(out)}`);
+	}
+
+	// 3. Long file:// link never expands into multi-line raw URL while streaming (including inside list items)
+	const linkLine = "- Xem [codemode.ts](file:///Users/rongmauhong/Documents/Repo/ragnarok/pi-md-render/src/render/codemode.ts) ngay";
+	for (let i = 20; i <= linkLine.length; i++) {
+		const lines = render(linkLine.slice(0, i), 60, true);
+		assert.equal(lines.length, 1, `link jumped to ${lines.length} lines at prefix ${i}: ${JSON.stringify(lines)}`);
+		const visible = lines[0]!.replace(/\x1b\]8;;[^\x1b]*\x1b\\/g, "");
+		assert.ok(!visible.includes("file:///"), `visible file:// URL leaked at prefix ${i}: ${JSON.stringify(visible)}`);
+	}
+
+	// 4. Bare heading prefix `#` -> `##` -> `### ` never flashes raw `#` or draws empty underlines
+	for (const partial of ["#", "##", "###", "# ", "## "]) {
+		const lines = render(partial, 80, true);
+		assert.deepEqual(lines, [], `expected empty lines for bare heading prefix ${JSON.stringify(partial)}, got ${JSON.stringify(lines)}`);
+	}
+	assert.deepEqual(render("### Tiêu đề", 80, true), ["▍ Tiêu đề"]);
+
+	// 5. Mid-row streaming table holds back incomplete row until all columns + closing `|` or `\n`, preventing column-width jitter & multi-column blinking
+	const headerAndRow1 = "| Name | Path | Note |\n|---|---|---|\n| a | short | ok |\n";
+	const baseTable = render(headerAndRow1, 80, true);
+	for (const partialRow of [
+		"| b",
+		"| b |",
+		"| b | /Users/very/long/path",
+		"| b | /Users/very/long/path |",
+		"| b | /Users/very/long/path | still typing",
+	]) {
+		assert.deepEqual(
+			render(headerAndRow1 + partialRow, 80, true),
+			baseTable,
+			`incomplete 3-col row ${JSON.stringify(partialRow)} should not blink or shake table columns`,
+		);
+	}
+	const closedRowTable = render(headerAndRow1 + "| b | done | ok |", 80, true);
+	assert.ok(closedRowTable.some((l) => l.includes("done")), "completed 3-col row with closing '|' renders immediately");
+	const finalUnclosedTable = render(headerAndRow1 + "| b | partial | x", 80, false);
+	assert.ok(finalUnclosedTable.some((l) => l.includes("partial")), "final non-streaming render still includes trailing row");
+
+	// 6. Normal multiplication and closed constructs remain untouched
+	assert.equal(stabilizeStreamingInline("2 * 3 = 6"), "2 * 3 = 6");
+	assert.equal(stabilizeStreamingInline("foo*bar and x**2"), "foo*bar and x**2");
+	assert.equal(stabilizeStreamingInline("**done** and `ok` and [a](https://x)"), "**done** and `ok` and [a](https://x)");
+});
+
 
 

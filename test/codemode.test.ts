@@ -12,6 +12,7 @@ import {
 	parseCallArgsLenient,
 	parseCodemodeHeaderOptions,
 	shortenDisplayPath,
+	shortenShellCommandPaths,
 } from "../src/render/codemode.ts";
 import { createShellToolRendererResolver } from "../src/render/shell.ts";
 import { state } from "../src/state.ts";
@@ -405,4 +406,106 @@ test("shortenDisplayPath prefers cwd-relative paths, falls back to ~, and keeps 
 	}
 	assert.match(editLines[0]!, /runtime_login_send_hook\.cpp/);
 	assert.match(editLines[1]!, /fps_overlay_policy_test\.cpp/);
+});
+
+test("shortenShellCommandPaths shortens cwd and $HOME paths in codemode bash/ls calls without touching sibling prefixes or URLs", () => {
+	const home = homedir();
+	const cwd = `${home}/Documents/Repo/ragnarok`;
+
+	assert.equal(
+		shortenShellCommandPaths(`ls -1 ${cwd}/lani-server/sql-files/`, cwd),
+		"ls -1 lani-server/sql-files/",
+	);
+	assert.equal(
+		shortenShellCommandPaths(
+			`rg -n "instance|unique_id" ${cwd}/lani-server/npc/custom/achievement_tracking.txt 2>&1 | head -n 40`,
+			cwd,
+		),
+		`rg -n "instance|unique_id" lani-server/npc/custom/achievement_tracking.txt 2>&1 | head -n 40`,
+	);
+	assert.equal(
+		shortenShellCommandPaths(`cd ${cwd} && cat "${cwd}/my dir/a.txt"`, cwd),
+		`cd . && cat "my dir/a.txt"`,
+	);
+	assert.equal(
+		shortenShellCommandPaths(`ls -1 ~/Documents/Repo/ragnarok/lani-server/sql-files/`, cwd),
+		"ls -1 lani-server/sql-files/",
+	);
+	assert.equal(
+		shortenShellCommandPaths(`cat ${home}/.pi/agent/settings.json`, cwd),
+		"cat ~/.pi/agent/settings.json",
+	);
+	assert.equal(
+		shortenShellCommandPaths(`rg -n foo ${cwd}-backup/file.txt`, cwd),
+		"rg -n foo ~/Documents/Repo/ragnarok-backup/file.txt",
+	);
+	assert.equal(
+		shortenShellCommandPaths(`curl https://example.com${home}/file.txt`, cwd),
+		`curl https://example.com${home}/file.txt`,
+	);
+	assert.equal(
+		shortenShellCommandPaths(`ls -1 ${home}/Documents/Repo/ragnarok/lani-server/sql-files/`),
+		"ls -1 ~/Documents/Repo/ragnarok/lani-server/sql-files/",
+	);
+
+	// End-to-end codemode bash + ls rendering keeps shortened command + duration inline on 1 row
+	const ansiTheme: ThemeLike = {
+		name: "ansi",
+		fg: (_c, t) => t,
+		bold: (t) => t,
+		italic: (t) => t,
+		underline: (t) => t,
+		strikethrough: (t) => t,
+		getFgAnsi: () => "",
+		getBgAnsi: () => "",
+	};
+	const resolver = createCodemodeToolRendererResolver(() => () => undefined);
+	const renderer = resolver("codemode", () => ({
+		renderResult() {
+			const c = new Container();
+			c.addChild(new Text("placeholder", 0, 0));
+			return c;
+		},
+	}))!;
+
+	const comp = renderer.renderResult!(
+		{
+			content: [{ type: "text", text: "ok" }],
+			details: {
+				calls: [
+					{
+						name: "bash",
+						args: JSON.stringify({
+							command: `rg -n "instance|unique_id" ${cwd}/lani-server/npc/custom/achievement_tracking.txt 2>&1 | head -n 40`,
+							toolSummary: "Check achievement_tracking.txt",
+						}),
+						status: "ok",
+						durationMs: 9,
+					},
+					{
+						name: "ls",
+						args: JSON.stringify({ path: `${cwd}/lani-server/sql-files` }),
+						status: "ok",
+						durationMs: 2,
+					},
+				],
+			},
+		},
+		{ expanded: false, isPartial: false },
+		ansiTheme,
+		{ isError: false, state: {}, cwd },
+	) as Container;
+
+	const lines = comp
+		.render(100)
+		.map((l) => l.replace(/\x1b\]8;;[^\x07]*\x07/g, "").trimEnd())
+		.filter((l) => l.length > 0);
+	const bashLine = lines.find((l) => l.startsWith("✓ $ "));
+	const lsLine = lines.find((l) => l.startsWith("✓ ls "));
+	assert.ok(bashLine, `expected bash line in ${JSON.stringify(lines)}`);
+	assert.ok(lsLine, `expected ls line in ${JSON.stringify(lines)}`);
+	assert.ok(!bashLine!.includes(home), `expected home path shortened in ${bashLine}`);
+	assert.ok(bashLine!.length <= 100, `expected <= 100 cols, got ${bashLine!.length}: ${bashLine}`);
+	assert.match(bashLine!, /lani-server\/npc\/custom\/achievement_tracking\.txt.*  9ms$/);
+	assert.equal(lsLine, "✓ ls lani-server/sql-files  2ms");
 });
