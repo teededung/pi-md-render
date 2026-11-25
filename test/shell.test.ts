@@ -124,6 +124,24 @@ test("unified git diff, commit/push/log, test runners, JSON, and compiler diagno
 		(code, lang) => [`[${lang}]${code}`],
 	);
 	assert.equal(jsonOut, '[json]{"ok":true}\x1b[22;23;24;29;39m');
+
+	// Section banners like `--- next-ma ---` or `--- PART 0 ---` must NOT be mistaken for unified diff headers
+	const bannerSample = [
+		" 1 file changed, 29 insertions(+), 10 deletions(-)",
+		"--- next-ma ---",
+		"- bullet item after banner stays plain",
+		"575c8e37b [next-ma] feat(map): add 1-tick bulk reset_instance_cooldowns map action",
+	].join("\n");
+	const bannerLines = colorizeShellOutput(bannerSample, theme).split("\n");
+	assert.equal(bannerLines[1], "<toolOutput>--- next-ma ---</toolOutput>");
+	assert.equal(bannerLines[2], "<toolOutput>- bullet item after banner stays plain</toolOutput>");
+	assert.match(bannerLines[3]!, /^<warning>575c8e37b<\/warning>/);
+
+	// Plain `diff -u` headers (without `a/`/`b/` prefixes) still colorize when paired (`---` followed by `+++`)
+	const plainDiffU = ["--- old.txt\t2026-11-24", "+++ new.txt\t2026-11-24", "@@ -1 +1 @@", "-a", "+b"].join("\n");
+	const diffULines = colorizeShellOutput(plainDiffU, theme).split("\n");
+	assert.equal(diffULines[0], "<b><toolDiffRemoved>--- old.txt\t2026-11-24</toolDiffRemoved></b>");
+	assert.equal(diffULines[1], "<b><toolDiffAdded>+++ new.txt\t2026-11-24</toolDiffAdded></b>");
 });
 
 test("sanitizeShellTextKeepSgr and sanitizeLineSgrForBox preserve fg SGR while stripping unsafe escapes and bg resets", () => {

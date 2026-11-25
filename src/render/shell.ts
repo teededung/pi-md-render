@@ -233,6 +233,23 @@ export function formatShellCommandCall(
 	return `${promptDisplay} ${commandDisplay}${timeoutSuffix}`;
 }
 
+function isUnifiedDiffOldHeader(line: string, nextLine: string | undefined): boolean {
+	if (!/^---\s+\S/.test(line) || /\s---+\s*$/.test(line)) return false;
+	if (/^---\s+(?:a\/|"a\/|\/dev\/null\b)/.test(line)) return true;
+	return nextLine !== undefined && /^\+\+\+\s+\S/.test(nextLine) && !/\s\+\+\++\s*$/.test(nextLine);
+}
+
+function isUnifiedDiffNewHeader(
+	line: string,
+	prevLine: string | undefined,
+	nextLine: string | undefined,
+): boolean {
+	if (!/^\+\+\+\s+\S/.test(line) || /\s\+\+\++\s*$/.test(line)) return false;
+	if (/^\+\+\+\s+(?:b\/|"b\/|\/dev\/null\b)/.test(line)) return true;
+	if (nextLine !== undefined && /^@@\s+-\d+/.test(nextLine)) return true;
+	return prevLine !== undefined && /^---\s+\S/.test(prevLine) && !/\s---+\s*$/.test(prevLine);
+}
+
 /**
  * Colorize shell stdout/stderr text for display inside a TUI tool box.
  * Never mutates the underlying tool result sent to the LLM.
@@ -267,7 +284,8 @@ export function colorizeShellOutput(
 	const out: string[] = [];
 	let inUnifiedDiff = false;
 
-	for (const line of lines) {
+	for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+		const line = lines[lineIdx]!;
 		if (!line) {
 			out.push("");
 			continue;
@@ -294,12 +312,12 @@ export function colorizeShellOutput(
 			out.push(fg(theme, "muted", "toolOutput", line));
 			continue;
 		}
-		if (/^---\s+(?:a\/|\S)/.test(line)) {
+		if (isUnifiedDiffOldHeader(line, lines[lineIdx + 1])) {
 			inUnifiedDiff = true;
 			out.push(theme.bold(fg(theme, "toolDiffRemoved", "error", line)));
 			continue;
 		}
-		if (/^\+\+\+\s+(?:b\/|\S)/.test(line)) {
+		if (isUnifiedDiffNewHeader(line, lines[lineIdx - 1], lines[lineIdx + 1])) {
 			inUnifiedDiff = true;
 			out.push(theme.bold(fg(theme, "toolDiffAdded", "success", line)));
 			continue;

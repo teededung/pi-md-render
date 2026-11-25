@@ -8,11 +8,13 @@ import {
 	extractCallsFromCode,
 	formatCodemodeCalls,
 	formatCodemodeHeader,
+	formatCodemodeOutputPreview,
 	middleTruncatePath,
 	parseCallArgsLenient,
 	parseCodemodeHeaderOptions,
 	shortenDisplayPath,
 	shortenShellCommandPaths,
+	unwrapCodemodeOutputText,
 } from "../src/render/codemode.ts";
 import { createShellToolRendererResolver } from "../src/render/shell.ts";
 import { state } from "../src/state.ts";
@@ -610,4 +612,120 @@ test("extractCallsFromCode resolves const string bindings in template literals a
 	);
 	assert.match(dynamicOut, /List dynamic dir/);
 	assert.match(dynamicOut, /\/some\/very\/long\/dynamic\/path\/trunc…/);
+});
+
+test("codemode trims leading blank lines on python heredoc commands and renders Option 1 unwrapped output preview", () => {
+	const home = homedir();
+	const cwd = `${home}/Documents/Repo/ragnarok`;
+	const code = [
+		"const results = await Promise.allSettled([",
+		"  tools.bash({",
+		'    toolSummary: "Print campaigns 1-4 and check all custom/import NoTrade items",',
+		"    command: String.raw`",
+		"python3 - <<'PY'",
+		"import json",
+		`with open("${home}/.gemini/antigravity-cli/brain/output.txt") as f:`,
+		"    raw = f.read()",
+		"print(raw[:100])",
+		"PY",
+		"`",
+		"  })",
+		"]);",
+		"return results.map((r, i) => ({ i, status: r.status, value: r.value }));",
+	].join("\n");
+
+	const ansiTheme: ThemeLike = {
+		name: "ansi",
+		fg: (_c, t) => t,
+		bold: (t) => t,
+		italic: (t) => t,
+		underline: (t) => t,
+		strikethrough: (t) => t,
+		getFgAnsi: () => "",
+		getBgAnsi: () => "",
+	};
+	const resolver = createCodemodeToolRendererResolver(() => () => undefined);
+	const renderer = resolver("codemode", () => ({
+		renderResult() {
+			const c = new Container();
+			c.addChild(new Text("placeholder", 0, 0));
+			return c;
+		},
+	}))!;
+
+	const jsonReturn = JSON.stringify([
+		{
+			i: 0,
+			status: "fulfilled",
+			value: {
+				output: [
+					"COMEBACK999, COMEBACK-YW4BWZ ... (+112 more)",
+					"  Desc: Quà comeback job 3",
+					"  - x10 [12263] Field Manual [NoTrade]",
+					"  - x15 [23012] Small Mana Potion [NoTrade]",
+					"  - x30 [23636] Guyak Pudding [NoTrade]",
+					"  - x1 [50008] Vé VIP 7 ngày [NoTrade]",
+				].join("\n"),
+				truncated: false,
+				exit_code: 0,
+				wall_time_seconds: 0,
+			},
+		},
+	]);
+
+	const collapsedComp = renderer.renderResult!(
+		{
+			content: [
+				{ type: "text", text: "Script completed\nWall time 0.1 seconds\nOutput:\n" },
+				{ type: "text", text: jsonReturn },
+			],
+			details: {
+				calls: [
+					{
+						name: "bash",
+						args: `{"toolSummary":"Print campaigns 1-4 and check all custom/import NoTrade items","command":"\\npython3 - <<'PY'\\nimport json...`,
+						status: "ok",
+						durationMs: 25,
+					},
+				],
+			},
+		},
+		{ expanded: false, isPartial: false },
+		ansiTheme,
+		{ isError: false, state: {}, cwd, args: { code } },
+	) as Container;
+
+	const collapsedLines = collapsedComp.render(120).map((l) => l.trimEnd());
+	const collapsedText = collapsedLines.join("\n");
+	// `python3 - <<'PY'` sits right on the `$` line (no lonely `✓ $` line!)
+	assert.ok(collapsedLines.some((l) => l === "✓ $ python3 - <<'PY'"), `expected inline python3 heredoc header in ${JSON.stringify(collapsedLines)}`);
+	assert.match(collapsedText, /with open\("~\/\.gemini\/antigravity-cli\/brain\/output\.txt"\) as f:/);
+	// Option 1 `--- output ---` unwraps JSON and shows 4 lines + (+2 lines, ctrl+o to expand)
+	assert.match(collapsedText, /--- output ---/);
+	assert.match(collapsedText, /COMEBACK999, COMEBACK-YW4BWZ/);
+	assert.match(collapsedText, /Small Mana Potion \[NoTrade\]/);
+	assert.doesNotMatch(collapsedText, /Vé VIP 7 ngày/);
+	assert.match(collapsedText, /… \(\+2 lines, ctrl\+o to expand\)/);
+	assert.doesNotMatch(collapsedText, /"status":"fulfilled"/);
+
+	// Expanded reveals all lines
+	const expandedComp = renderer.renderResult!(
+		{
+			content: [
+				{ type: "text", text: "Script completed\nWall time 0.1 seconds\nOutput:\n" },
+				{ type: "text", text: jsonReturn },
+			],
+			details: { calls: [] },
+		},
+		{ expanded: true, isPartial: false },
+		ansiTheme,
+		{ isError: false, state: {}, cwd, args: { code } },
+	) as Container;
+	const expandedText = expandedComp.render(120).map((l) => l.trimEnd()).join("\n");
+	assert.match(expandedText, /Vé VIP 7 ngày \[NoTrade\]/);
+
+	// `==> text k/N <==` headers and empty JSON returns are cleaned properly
+	assert.equal(unwrapCodemodeOutputText("==> text 1/2 <==\nPart A\n==> text 2/2 <==\nPart B"), "Part A\nPart B");
+	assert.equal(formatCodemodeOutputPreview("null", false, ansiTheme), "");
+	assert.equal(formatCodemodeOutputPreview("{}", false, ansiTheme), "");
 });

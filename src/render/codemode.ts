@@ -22,6 +22,7 @@ import {
 import { state } from "../state.ts";
 import type { Highlighter, ThemeLike } from "../style.ts";
 import {
+	colorizeShellOutput,
 	extractToolSummaryArg,
 	fg,
 	formatInlineToolSummary,
@@ -68,6 +69,8 @@ const SUMMARY_META_KEYS = new Set([
 const CALL_PREVIEW_COUNT = 6;
 const COLLAPSED_BASH_MAX_LINES = 3;
 const COLLAPSED_BASH_LINE_CHARS = 140;
+const COLLAPSED_OUTPUT_MAX_LINES = 4;
+const EXPANDED_OUTPUT_MAX_LINES = 120;
 
 function getTargetContainer(
 	comp: unknown,
@@ -976,34 +979,39 @@ export function formatSingleNestedCallBody(
 			const lang = cleanName === "powershell" ? "powershell" : "bash";
 			const shortenedCmd = shortenShellCommandPaths(rawCmd, cwd);
 			const lines = shortenedCmd.replace(/\r\n?/g, "\n").split("\n");
-			let displayCmd = lines.join("\n");
-			let hiddenLines = 0;
-			if (!expanded) {
-				const maxLineChars =
-					lineBudget !== undefined
-						? Math.min(COLLAPSED_BASH_LINE_CHARS, Math.max(20, lineBudget - prompt.length - 1))
-						: COLLAPSED_BASH_LINE_CHARS;
-				const clipped = lines.slice(0, COLLAPSED_BASH_MAX_LINES).map((line) =>
-					line.length > maxLineChars ? `${line.slice(0, maxLineChars - 1)}…` : line,
-				);
-				hiddenLines = Math.max(0, lines.length - COLLAPSED_BASH_MAX_LINES);
-				displayCmd = clipped.join("\n");
+			while (lines.length > 0 && lines[0]!.trim() === "") lines.shift();
+			while (lines.length > 0 && lines[lines.length - 1]!.trim() === "") lines.pop();
+			if (lines.length > 0) lines[0] = lines[0]!.trimStart();
+			if (lines.length > 0) {
+				let displayCmd = lines.join("\n");
+				let hiddenLines = 0;
+				if (!expanded) {
+					const maxLineChars =
+						lineBudget !== undefined
+							? Math.min(COLLAPSED_BASH_LINE_CHARS, Math.max(20, lineBudget - prompt.length - 1))
+							: COLLAPSED_BASH_LINE_CHARS;
+					const clipped = lines.slice(0, COLLAPSED_BASH_MAX_LINES).map((line) =>
+						line.length > maxLineChars ? `${line.slice(0, maxLineChars - 1)}…` : line,
+					);
+					hiddenLines = Math.max(0, lines.length - COLLAPSED_BASH_MAX_LINES);
+					displayCmd = clipped.join("\n");
+				}
+				const formatted =
+					formatShellCommandCall(
+						{ command: displayCmd, timeout: pickNum(args, ["timeout"]) },
+						prompt,
+						lang,
+						theme,
+						highlight,
+					) ?? `${theme.bold(fg(theme, "accent", "toolTitle", prompt))} ${displayCmd}`;
+				const indented = formatted
+					.split("\n")
+					.map((l, idx) => (idx === 0 ? l : `  ${l}`))
+					.join("\n");
+				return hiddenLines > 0
+					? `${indented}\n  ${fg(theme, "muted", "dim", `… (+${hiddenLines} lines)`)}`
+					: indented;
 			}
-			const formatted =
-				formatShellCommandCall(
-					{ command: displayCmd, timeout: pickNum(args, ["timeout"]) },
-					prompt,
-					lang,
-					theme,
-					highlight,
-				) ?? `${theme.bold(fg(theme, "accent", "toolTitle", prompt))} ${displayCmd}`;
-			const indented = formatted
-				.split("\n")
-				.map((l, idx) => (idx === 0 ? l : `  ${l}`))
-				.join("\n");
-			return hiddenLines > 0
-				? `${indented}\n  ${fg(theme, "muted", "dim", `… (+${hiddenLines} lines)`)}`
-				: indented;
 		}
 	}
 
@@ -1230,6 +1238,157 @@ export function colorizeCodemodeError(rawOutput: string, theme: ThemeLike): stri
 		.join("\n");
 }
 
+const NOISY_RESULT_META_KEYS = new Set([
+	"truncated",
+	"exit_code",
+	"exitCode",
+	"wall_time_seconds",
+	"wallTimeSeconds",
+	"i",
+	"index",
+	"status",
+]);
+
+function extractReadableResultChunks(val: unknown): string[] {
+	if (val === null || val === undefined) return [];
+	if (typeof val === "string") {
+		const cleaned = val.replace(/\r\n?/g, "\n").trimEnd();
+		return cleaned.trim() ? [cleaned] : [];
+	}
+	if (typeof val === "number" || typeof val === "boolean") {
+		return [String(val)];
+	}
+	if (Array.isArray(val)) {
+		return val.flatMap((item) => extractReadableResultChunks(item));
+	}
+	if (typeof val === "object") {
+		const rec = val as Record<string, unknown>;
+		if (rec.status === "fulfilled" && "value" in rec) {
+			return extractReadableResultChunks(rec.value);
+		}
+		if (rec.status === "rejected" && "reason" in rec) {
+			return extractReadableResultChunks(rec.reason);
+		}
+		if (typeof rec.output === "string") {
+			return extractReadableResultChunks(rec.output);
+		}
+		const nonMetaKeys = Object.keys(rec).filter((k) => !NOISY_RESULT_META_KEYS.has(k));
+		if (
+			nonMetaKeys.length === 1 &&
+			(nonMetaKeys[0] === "stdout" || nonMetaKeys[0] === "text" || nonMetaKeys[0] === "value") &&
+			typeof rec[nonMetaKeys[0]!] === "string"
+		) {
+			return extractReadableResultChunks(rec[nonMetaKeys[0]!]);
+		}
+		const entries = Object.entries(rec).filter(
+			([k, v]) => !NOISY_RESULT_META_KEYS.has(k) && v !== undefined && v !== null && v !== "",
+		);
+		if (entries.length === 0) return [];
+		const allTextBlobs = entries.every(
+			([, v]) =>
+				typeof v === "string" ||
+				(typeof v === "object" &&
+					v !== null &&
+					("output" in (v as Record<string, unknown>) || "status" in (v as Record<string, unknown>))),
+		);
+		if (allTextBlobs) {
+			return entries.flatMap(([, v]) => extractReadableResultChunks(v));
+		}
+		return entries.map(([k, v]) => {
+			if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+				return `${k}: ${v}`;
+			}
+			return `${k}: ${JSON.stringify(v)}`;
+		});
+	}
+	return [];
+}
+
+/**
+ * Unwrap raw `codemode` return payloads (`Promise.allSettled` arrays, `{ output }`
+ * objects, `==> text k/N <==` chunks, and `Full output:` footers) into clean
+ * human-readable text lines without leaking JS glue variable names.
+ */
+export function unwrapCodemodeOutputText(rawOutput: string, cwd?: string): string {
+	if (!rawOutput) return "";
+	let cleaned = rawOutput
+		.replace(/\r\n?/g, "\n")
+		.replace(/^==> text \d+\/\d+ <==[ \t]*\n?/gm, "")
+		.replace(/\n?Full output:\s+\S+[ \t]*$/gm, "")
+		.replace(/\n?\[Output truncated[^\n]*\][ \t]*$/gm, "")
+		.trim();
+	if (!cleaned || cleaned === "undefined" || cleaned === "null" || cleaned === "{}" || cleaned === "[]") {
+		return "";
+	}
+	if (cleaned.startsWith("{") || cleaned.startsWith("[")) {
+		try {
+			const parsed = JSON.parse(cleaned) as unknown;
+			const chunks = extractReadableResultChunks(parsed);
+			cleaned = chunks.join("\n").trim();
+		} catch {
+			// Keep cleaned plain text if it is not valid JSON.
+		}
+	}
+	if (!cleaned) return "";
+	return shortenShellCommandPaths(cleaned, cwd);
+}
+
+/** Format the Option 1 `--- output ---` footer preview inside a `codemode` result card. */
+export function formatCodemodeOutputPreview(
+	rawOutput: string,
+	expanded: boolean,
+	theme: ThemeLike,
+	highlight?: Highlighter,
+	options?: { cwd?: string; width?: number },
+): string {
+	const unwrapped = unwrapCodemodeOutputText(rawOutput, options?.cwd);
+	if (!unwrapped) return "";
+	const rawLines = unwrapped.split("\n");
+	while (rawLines.length > 0 && rawLines[0]!.trim() === "") rawLines.shift();
+	while (rawLines.length > 0 && rawLines[rawLines.length - 1]!.trim() === "") rawLines.pop();
+	if (rawLines.length === 0) return "";
+
+	const header = `  ${fg(theme, "muted", "dim", "--- output ---")}`;
+	const maxLines = expanded ? EXPANDED_OUTPUT_MAX_LINES : COLLAPSED_OUTPUT_MAX_LINES;
+	const maxCols =
+		!expanded && options?.width !== undefined
+			? Math.max(20, options.width - 2)
+			: !expanded
+				? COLLAPSED_BASH_LINE_CHARS
+				: undefined;
+
+	const slice = rawLines.slice(0, maxLines).map((line) => {
+		if (maxCols === undefined) return line;
+		const plain = line.replace(SGR_STRIP_RE, "");
+		if (visibleWidth(plain) <= maxCols) return line;
+		const chars = Array.from(plain);
+		let out = "";
+		for (const ch of chars) {
+			if (visibleWidth(`${out}${ch}…`) > maxCols) break;
+			out += ch;
+		}
+		return `${out}…`;
+	});
+
+	const colored = colorizeShellOutput(slice.join("\n"), theme, highlight);
+	const body = (colored || slice.join("\n"))
+		.split("\n")
+		.map((l) => `  ${l}`)
+		.join("\n");
+
+	const remaining = rawLines.length - slice.length;
+	const moreLine =
+		remaining > 0
+			? `\n  ${fg(
+					theme,
+					"muted",
+					"dim",
+					expanded ? `… (+${remaining} lines)` : `… (+${remaining} lines, ctrl+o to expand)`,
+				)}`
+			: "";
+	return `${header}\n${body}${moreLine}`;
+}
+
 function extractCodemodeOutputText(
 	result: { content?: Array<{ type?: string; text?: string }> } | undefined,
 ): string {
@@ -1372,9 +1531,11 @@ export function createCodemodeToolRendererResolver(
 									? (context as { cwd: string }).cwd
 									: undefined;
 
+							const expanded = Boolean(options?.expanded);
+							const hl = getHighlighter();
+							const themeLike = theme as ThemeLike;
 							const nextChildren: unknown[] = [];
 							if (calls.length > 0) {
-								const expanded = Boolean(options?.expanded);
 								let extractedCalls = renderState?.extractedCalls;
 								if (!extractedCalls) {
 									const rawCode = (context as { args?: { code?: unknown } } | undefined)?.args?.code;
@@ -1386,8 +1547,6 @@ export function createCodemodeToolRendererResolver(
 										}
 									}
 								}
-								const hl = getHighlighter();
-								const themeLike = theme as ThemeLike;
 								nextChildren.push(new Spacer(1));
 								nextChildren.push(
 									new CodemodeCallsComponent((width) =>
@@ -1401,14 +1560,28 @@ export function createCodemodeToolRendererResolver(
 								);
 							}
 
-							// Suppress normal script return output (`tuiText` / JSON blobs); only surface script crashes.
-							if (Boolean(context?.isError) && !options?.isPartial) {
-								const errRaw = extractCodemodeOutputText(result);
-								if (errRaw) {
-									nextChildren.push(new Spacer(1));
-									nextChildren.push(
-										new Text(colorizeCodemodeError(errRaw, theme as ThemeLike), 0, 0),
-									);
+							if (!options?.isPartial) {
+								const rawOut = extractCodemodeOutputText(result);
+								if (Boolean(context?.isError)) {
+									if (rawOut) {
+										nextChildren.push(new Spacer(1));
+										nextChildren.push(
+											new Text(colorizeCodemodeError(rawOut, themeLike), 0, 0),
+										);
+									}
+								} else if (rawOut) {
+									const previewCheck = unwrapCodemodeOutputText(rawOut, cwd);
+									if (previewCheck) {
+										nextChildren.push(new Spacer(1));
+										nextChildren.push(
+											new CodemodeCallsComponent((width) =>
+												formatCodemodeOutputPreview(rawOut, expanded, themeLike, hl, {
+													cwd,
+													width,
+												}),
+											),
+										);
+									}
 								}
 							}
 
