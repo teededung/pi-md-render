@@ -100,6 +100,8 @@ export function renderTable(token: any, ctx: RenderContext): string[] {
 
 	const border = (s: string) => style.fg("mdCodeBlockBorder", s);
 	const rule = (l: string, m: string, r: string) => border(l + widths.map((w) => "─".repeat(w + 2)).join(m) + r);
+	const rowDivider = () =>
+		border("├") + widths.map((w) => style.fg("dim", "─".repeat(w + 2))).join(style.fg("dim", "┼")) + border("┤");
 	const renderRow = (cells: string[], isHeader: boolean): string[] => {
 		const wrapped = widths.map((w, i) => wrap(cells[i] ?? "", w));
 		const height = Math.max(...wrapped.map((c) => c.length));
@@ -117,7 +119,13 @@ export function renderTable(token: any, ctx: RenderContext): string[] {
 	};
 
 	const lines = [rule("╭", "┬", "╮"), ...renderRow(header, true), rule("├", "┼", "┤")];
-	for (const row of rows) lines.push(...renderRow(row, false));
+	const renderedRows = rows.map((row) => renderRow(row, false));
+	const hasMultiLineRow = renderedRows.some((rendered) => rendered.length > 1);
+	const divider = hasMultiLineRow ? rowDivider() : undefined;
+	renderedRows.forEach((rendered, i) => {
+		if (i > 0 && divider) lines.push(divider);
+		lines.push(...rendered);
+	});
 	lines.push(rule("╰", "┴", "╯"));
 	return lines;
 }

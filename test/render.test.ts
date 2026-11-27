@@ -342,5 +342,39 @@ test("streaming stabilizer eliminates raw marker flashes, URL jumps, heading bou
 	assert.equal(stabilizeStreamingInline("**done** and `ok` and [a](https://x)"), "**done** and `ok` and [a](https://x)");
 });
 
+test("multi-line wrapped tables separate body rows with a subtle divider while single-line tables stay compact", () => {
+	// Single-line rows stay compact without extra vertical dividers.
+	const compact = render("| A | B |\n|---|---|\n| 1 | x |\n| 2 | y |", 60);
+	assert.equal(
+		compact.filter((l) => l.startsWith("├")).length,
+		1,
+		"single-line table should only have the header divider",
+	);
+
+	// Multi-line wrapped rows get a clean row separator between body rows.
+	const wrappedMd = [
+		"| Dungeon | Boss | Mechanic |",
+		"|---|---|---|",
+		"| Illusion of Moonlight | Angry Moonlight Flower | Kill 1000 Nine Tails to roll MVP spawn on map |",
+		"| Illusion of Moonlight | Wizard of the Truth | Kill 10 Deranged Adventurers to spawn boss |",
+		"| Illusion of Frozen | Awakened Ktullanux | Click 4 Orbs within 30s to summon MVP |",
+	].join("\n");
+	const lines = render(wrappedMd, 60);
+	// Header rule + 2 body row dividers between the 3 body rows = 3 `├...┤` lines.
+	const dividers = lines.filter((l) => l.startsWith("├") && l.endsWith("┤"));
+	assert.equal(dividers.length, 3, `expected header + 2 row dividers, got:\n${lines.join("\n")}`);
+	const widths = new Set(lines.map(visibleWidth));
+	assert.equal(widths.size, 1, "all lines including row dividers must match exact table width");
+
+	// Styled render dims the inner row divider so it stays softer than the header rule.
+	const style = createStyle(darkTheme(), () => undefined);
+	const styledLines = renderMarkdown(wrappedMd, 60, { style, math: noMath, streaming: false });
+	const styledBodyDividers = styledLines.filter((l) => l.includes("┼")).slice(1);
+	assert.equal(styledBodyDividers.length, 2);
+	for (const div of styledBodyDividers) {
+		assert.ok(div.includes("\x1b[38;2;102;102;102m"), `expected dim (#666666) inner row rule: ${JSON.stringify(div)}`);
+	}
+});
+
 
 
